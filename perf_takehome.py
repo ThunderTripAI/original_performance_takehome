@@ -221,43 +221,76 @@ class KernelBuilder:
         v_tmp2 = [[self.alloc_scratch(None, VLEN) for _ in range(GROUP_SIZE)] for _ in range(BUFFERS)]
 
         # Overlap address computation AND vbroadcasts with loads for initial data
-        idx_addrs = [self.alloc_scratch() for _ in range(n_vectors)]
-        val_addrs = [self.alloc_scratch() for _ in range(n_vectors)]
+        # For vi=0, use inp_indices_p and inp_values_p directly (offset is 0)
+        # For vi>0, compute addresses on the fly
+        idx_addrs = [self.scratch["inp_indices_p"]] + [self.alloc_scratch() for _ in range(n_vectors - 1)]
+        val_addrs = [self.scratch["inp_values_p"]] + [self.alloc_scratch() for _ in range(n_vectors - 1)]
 
-        # Compute first address
-        base0 = self.scratch_const(0)
-        self.add_bundle({"alu": [
-            ("+", idx_addrs[0], self.scratch["inp_indices_p"], base0),
-            ("+", val_addrs[0], self.scratch["inp_values_p"], base0)
-        ]})
+        # Preload offset constants for data loading (8, 16, ..., 248) - skip 0 since it's not needed
+        offset_consts = [vi * VLEN for vi in range(1, n_vectors)]
+        self.batch_scratch_consts(offset_consts)
+        # Also ensure 0 is in const_map (might already be from all_const_values)
+        if 0 not in self.const_map:
+            self.scratch_const(0)
 
-        # Pipeline: load[vi] while computing addr[vi+1] AND doing vbroadcasts
+        # Precompute first group address ALU ops (will be overlapped with data loads)
+        # For group 0, slot s uses all_idx[s], so we can compute after all_idx[s] is loaded
+        forest_p = self.scratch["forest_values_p"]
+        first_group_addr_ops = []
+        for slot in range(GROUP_SIZE):
+            vi = slot  # For group 0, iteration uses vi = slot
+            for j in range(VLEN):
+                first_group_addr_ops.append((slot, ("+", s_addr[0][slot][j], forest_p, all_idx[vi] + j)))
+        first_addr_idx = 0
+
+        # Pipeline: load[vi] while computing addr[vi+1], vbroadcasts, AND first group addresses
         vb_idx = 0
         for vi in range(n_vectors):
             bundle = {"load": [
                 ("vload", all_idx[vi], idx_addrs[vi]),
                 ("vload", all_val[vi], val_addrs[vi])
             ]}
+            alu_ops = []
+            # Compute address for vi+1 (vi=0 uses base pointers directly, so start computing at vi=0 for vi+1=1)
             if vi + 1 < n_vectors:
-                base_next = self.scratch_const((vi + 1) * VLEN)
-                bundle["alu"] = [
+                base_next = self.const_map[(vi + 1) * VLEN]
+                alu_ops.extend([
                     ("+", idx_addrs[vi+1], self.scratch["inp_indices_p"], base_next),
                     ("+", val_addrs[vi+1], self.scratch["inp_values_p"], base_next)
-                ]
+                ])
+            # Add first group address ops for slots whose data has been loaded (vi-1 and earlier)
+            # After loading vi, all_idx[0..vi] are available, so we can compute addresses for slots 0..vi
+            while first_addr_idx < len(first_group_addr_ops) and len(alu_ops) < 12:
+                slot, op = first_group_addr_ops[first_addr_idx]
+                if slot < vi:  # slot's data (all_idx[slot]) was loaded in previous cycle
+                    alu_ops.append(op)
+                    first_addr_idx += 1
+                else:
+                    break
+            if alu_ops:
+                bundle["alu"] = alu_ops
             # Overlap vbroadcasts with loads (up to 6 per cycle)
             if vb_idx < len(pending_vbroadcasts):
                 bundle["valu"] = pending_vbroadcasts[vb_idx:vb_idx+6]
                 vb_idx += 6
             self.add_bundle(bundle)
 
-        # Handle remaining vbroadcasts if any (shouldn't happen with 32 vectors and ~19 vbroadcasts)
+        # Handle remaining vbroadcasts if any
         while vb_idx < len(pending_vbroadcasts):
             self.add_bundle({"valu": pending_vbroadcasts[vb_idx:vb_idx+6]})
             vb_idx += 6
 
+        # Handle remaining first group address computation (if any slots weren't fully processed)
+        while first_addr_idx < len(first_group_addr_ops):
+            alu_ops = []
+            while first_addr_idx < len(first_group_addr_ops) and len(alu_ops) < 12:
+                slot, op = first_group_addr_ops[first_addr_idx]
+                alu_ops.append(op)
+                first_addr_idx += 1
+            self.add_bundle({"alu": alu_ops})
+
         self.add("flow", ("pause",))
 
-        forest_p = self.scratch["forest_values_p"]
         total_iters = rounds * n_vectors
         n_groups = (total_iters + GROUP_SIZE - 1) // GROUP_SIZE
 
@@ -328,15 +361,7 @@ class KernelBuilder:
         prev_iters = None
         prev_phase_idx = 0
         prev_gather_alu = []  # Gather ALU ops from previous group
-
-        # Precompute address ALU ops for first group
-        first_iters = get_group_iters(0, 0)
-        addr_alu_ops = []
-        for slot, v_idx, v_val in first_iters:
-            for j in range(VLEN):
-                addr_alu_ops.append(("+", s_addr[0][slot][j], forest_p, v_idx + j))
-        for i in range(0, len(addr_alu_ops), 12):
-            self.add_bundle({"alu": addr_alu_ops[i:i+12]})
+        # First group addresses already computed during data load phase
 
         for group in range(n_groups):
             buf = group % BUFFERS
@@ -402,13 +427,14 @@ class KernelBuilder:
 
                 self.add_bundle(bundle)
 
-            # Handle remaining VALU after loads complete
+            # Handle remaining VALU after loads complete (continue from valu_op_offset)
             while prev_buf is not None and prev_phase_idx < len(valu_phases):
                 valu_ops = emit_valu_for_group(prev_buf, prev_iters, valu_phases[prev_phase_idx])
                 if valu_ops:
-                    for i in range(0, len(valu_ops), 6):
+                    for i in range(valu_op_offset, len(valu_ops), 6):
                         self.add_bundle({"valu": valu_ops[i:i+6]})
                 prev_phase_idx += 1
+                valu_op_offset = 0  # Reset offset for subsequent phases
 
             # Handle remaining address ALU if not all overlapped
             while next_addr_idx < len(next_addr_alu):
@@ -437,15 +463,9 @@ class KernelBuilder:
             prev_phase_idx += 1
 
         # Overlap address computation with stores for final data
-        store_idx_addrs = [self.alloc_scratch() for _ in range(n_vectors)]
-        store_val_addrs = [self.alloc_scratch() for _ in range(n_vectors)]
-
-        # Compute first address
-        base0 = self.scratch_const(0)
-        self.add_bundle({"alu": [
-            ("+", store_idx_addrs[0], self.scratch["inp_indices_p"], base0),
-            ("+", store_val_addrs[0], self.scratch["inp_values_p"], base0)
-        ]})
+        # For vi=0, use inp_indices_p and inp_values_p directly
+        store_idx_addrs = [self.scratch["inp_indices_p"]] + [self.alloc_scratch() for _ in range(n_vectors - 1)]
+        store_val_addrs = [self.scratch["inp_values_p"]] + [self.alloc_scratch() for _ in range(n_vectors - 1)]
 
         # Pipeline: store[vi] while computing addr[vi+1]
         for vi in range(n_vectors):
@@ -454,7 +474,7 @@ class KernelBuilder:
                 ("vstore", store_val_addrs[vi], all_val[vi])
             ]}
             if vi + 1 < n_vectors:
-                base_next = self.scratch_const((vi + 1) * VLEN)
+                base_next = self.const_map[(vi + 1) * VLEN]
                 bundle["alu"] = [
                     ("+", store_idx_addrs[vi+1], self.scratch["inp_indices_p"], base_next),
                     ("+", store_val_addrs[vi+1], self.scratch["inp_values_p"], base_next)
