@@ -138,7 +138,7 @@ class KernelBuilder:
         all_idx = [self.alloc_scratch(f"idx_{vi}", VLEN) for vi in range(n_vectors)]
         all_val = [self.alloc_scratch(f"val_{vi}", VLEN) for vi in range(n_vectors)]
 
-        GROUP_SIZE = 3
+        GROUP_SIZE = 6
         BUFFERS = 2
         s_addr = [[[self.alloc_scratch() for _ in range(VLEN)] for _ in range(GROUP_SIZE)] for _ in range(BUFFERS)]
         s_node = [[[self.alloc_scratch() for _ in range(VLEN)] for _ in range(GROUP_SIZE)] for _ in range(BUFFERS)]
@@ -146,17 +146,30 @@ class KernelBuilder:
         v_tmp1 = [[self.alloc_scratch(None, VLEN) for _ in range(GROUP_SIZE)] for _ in range(BUFFERS)]
         v_tmp2 = [[self.alloc_scratch(None, VLEN) for _ in range(GROUP_SIZE)] for _ in range(BUFFERS)]
 
+        # Overlap address computation with loads for initial data
+        idx_addrs = [self.alloc_scratch() for _ in range(n_vectors)]
+        val_addrs = [self.alloc_scratch() for _ in range(n_vectors)]
+
+        # Compute first address
+        base0 = self.scratch_const(0)
+        self.add_bundle({"alu": [
+            ("+", idx_addrs[0], self.scratch["inp_indices_p"], base0),
+            ("+", val_addrs[0], self.scratch["inp_values_p"], base0)
+        ]})
+
+        # Pipeline: load[vi] while computing addr[vi+1]
         for vi in range(n_vectors):
-            base = self.scratch_const(vi * VLEN)
-            idx_addr, val_addr = self.alloc_scratch(), self.alloc_scratch()
-            self.add_bundle({"alu": [
-                ("+", idx_addr, self.scratch["inp_indices_p"], base),
-                ("+", val_addr, self.scratch["inp_values_p"], base)
-            ]})
-            self.add_bundle({"load": [
-                ("vload", all_idx[vi], idx_addr),
-                ("vload", all_val[vi], val_addr)
-            ]})
+            bundle = {"load": [
+                ("vload", all_idx[vi], idx_addrs[vi]),
+                ("vload", all_val[vi], val_addrs[vi])
+            ]}
+            if vi + 1 < n_vectors:
+                base_next = self.scratch_const((vi + 1) * VLEN)
+                bundle["alu"] = [
+                    ("+", idx_addrs[vi+1], self.scratch["inp_indices_p"], base_next),
+                    ("+", val_addrs[vi+1], self.scratch["inp_values_p"], base_next)
+                ]
+            self.add_bundle(bundle)
 
         self.add("flow", ("pause",))
 
@@ -210,13 +223,12 @@ class KernelBuilder:
             elif phase.startswith("idx_"):
                 step = int(phase.split("_")[1])
                 for slot, v_idx, v_val in iters:
-                    # Simplified: add = 1 + (val & 1) gives 1 if even, 2 if odd
+                    # Use multiply_add to combine idx*2 + tmp in one op
                     if step == 0: ops.append(("&", v_tmp1[buf][slot], v_val, one_v))  # tmp1 = val & 1
                     elif step == 1: ops.append(("+", v_tmp1[buf][slot], v_tmp1[buf][slot], one_v))  # tmp1 = tmp1 + 1
-                    elif step == 2: ops.append(("<<", v_idx, v_idx, one_v))  # idx = idx * 2
-                    elif step == 3: ops.append(("+", v_idx, v_idx, v_tmp1[buf][slot]))  # idx = idx + tmp1
-                    elif step == 4: ops.append(("<", v_tmp1[buf][slot], v_idx, n_nodes_v))  # tmp1 = idx < n_nodes
-                    elif step == 5: ops.append(("*", v_idx, v_idx, v_tmp1[buf][slot]))  # idx = idx * tmp1 (wrap)
+                    elif step == 2: ops.append(("multiply_add", v_idx, v_idx, two_v, v_tmp1[buf][slot]))  # idx = idx*2 + tmp
+                    elif step == 3: ops.append(("<", v_tmp1[buf][slot], v_idx, n_nodes_v))  # tmp1 = idx < n_nodes
+                    elif step == 4: ops.append(("*", v_idx, v_idx, v_tmp1[buf][slot]))  # idx = idx * tmp1 (wrap)
             return ops
 
         valu_phases = ["xor"]
@@ -225,40 +237,83 @@ class KernelBuilder:
             # Skip part 1 for multiply_add stages (they do it all in part 0)
             if hash_mult_v[hi] is None:
                 valu_phases.append(f"hash_{hi}_1")
-        for step in range(6):  # Simplified from 7 to 6 steps
+        for step in range(5):  # Reduced from 6 to 5 steps using multiply_add
             valu_phases.append(f"idx_{step}")
 
         prev_buf = None
         prev_iters = None
         prev_phase_idx = 0
+        prev_gather_alu = []  # Gather ALU ops from previous group
+
+        # Precompute address ALU ops for first group
+        first_iters = get_group_iters(0, 0)
+        addr_alu_ops = []
+        for slot, v_idx, v_val in first_iters:
+            for j in range(VLEN):
+                addr_alu_ops.append(("+", s_addr[0][slot][j], forest_p, v_idx + j))
+        for i in range(0, len(addr_alu_ops), 12):
+            self.add_bundle({"alu": addr_alu_ops[i:i+12]})
 
         for group in range(n_groups):
             buf = group % BUFFERS
             iters = get_group_iters(group, buf)
 
-            alu_ops = []
-            for slot, v_idx, v_val in iters:
-                for j in range(VLEN):
-                    alu_ops.append(("+", s_addr[buf][slot][j], forest_p, v_idx + j))
-            for i in range(0, len(alu_ops), 12):
-                self.add_bundle({"alu": alu_ops[i:i+12]})
+            # Precompute next group's address ALU (will be overlapped with this group's tail loads)
+            next_addr_alu = []
+            if group + 1 < n_groups:
+                next_buf = (group + 1) % BUFFERS
+                next_iters = get_group_iters(group + 1, next_buf)
+                for slot, v_idx, v_val in next_iters:
+                    for j in range(VLEN):
+                        next_addr_alu.append(("+", s_addr[next_buf][slot][j], forest_p, v_idx + j))
 
             all_loads = emit_loads_for_group(buf, iters)
 
             load_idx = 0
+            gather_idx = 0
+            valu_op_offset = 0
+            next_addr_idx = 0
+
+            # Phase 1: Overlap loads with gather ALU (until gather ALU completes)
+            while load_idx < len(all_loads) and gather_idx < len(prev_gather_alu):
+                bundle = {}
+                bundle["load"] = all_loads[load_idx:load_idx+2]
+                load_idx += 2
+                bundle["alu"] = prev_gather_alu[gather_idx:gather_idx+12]
+                gather_idx += 12
+                self.add_bundle(bundle)
+
+            # Phase 2: Overlap loads with VALU
+            while load_idx < len(all_loads) and prev_buf is not None and prev_phase_idx < len(valu_phases):
+                bundle = {}
+                bundle["load"] = all_loads[load_idx:load_idx+2]
+                load_idx += 2
+
+                valu_ops = emit_valu_for_group(prev_buf, prev_iters, valu_phases[prev_phase_idx])
+                if valu_ops:
+                    chunk = valu_ops[valu_op_offset:valu_op_offset+6]
+                    if chunk:
+                        bundle["valu"] = chunk
+                    valu_op_offset += 6
+                    if valu_op_offset >= len(valu_ops):
+                        prev_phase_idx += 1
+                        valu_op_offset = 0
+
+                self.add_bundle(bundle)
+
+            # Phase 3: Overlap remaining loads with next group's address ALU
             while load_idx < len(all_loads):
                 bundle = {}
                 bundle["load"] = all_loads[load_idx:load_idx+2]
                 load_idx += 2
 
-                if prev_buf is not None and prev_phase_idx < len(valu_phases):
-                    valu_ops = emit_valu_for_group(prev_buf, prev_iters, valu_phases[prev_phase_idx])
-                    if valu_ops:
-                        bundle["valu"] = valu_ops[:6]
-                    prev_phase_idx += 1
+                if next_addr_idx < len(next_addr_alu):
+                    bundle["alu"] = next_addr_alu[next_addr_idx:next_addr_idx+12]
+                    next_addr_idx += 12
 
                 self.add_bundle(bundle)
 
+            # Handle remaining VALU after loads complete
             while prev_buf is not None and prev_phase_idx < len(valu_phases):
                 valu_ops = emit_valu_for_group(prev_buf, prev_iters, valu_phases[prev_phase_idx])
                 if valu_ops:
@@ -266,16 +321,24 @@ class KernelBuilder:
                         self.add_bundle({"valu": valu_ops[i:i+6]})
                 prev_phase_idx += 1
 
-            alu_ops = []
+            # Handle remaining address ALU if not all overlapped
+            while next_addr_idx < len(next_addr_alu):
+                self.add_bundle({"alu": next_addr_alu[next_addr_idx:next_addr_idx+12]})
+                next_addr_idx += 12
+
+            # Prepare gather ALU for this group
+            prev_gather_alu = []
             for slot, v_idx, v_val in iters:
                 for j in range(VLEN):
-                    alu_ops.append(("+", v_node[buf][slot] + j, s_node[buf][slot][j], zero_const))
-            for i in range(0, len(alu_ops), 12):
-                self.add_bundle({"alu": alu_ops[i:i+12]})
+                    prev_gather_alu.append(("+", v_node[buf][slot] + j, s_node[buf][slot][j], zero_const))
 
             prev_buf = buf
             prev_iters = iters
             prev_phase_idx = 0
+
+        # Handle final group's gather ALU and VALU
+        for i in range(0, len(prev_gather_alu), 12):
+            self.add_bundle({"alu": prev_gather_alu[i:i+12]})
 
         while prev_buf is not None and prev_phase_idx < len(valu_phases):
             valu_ops = emit_valu_for_group(prev_buf, prev_iters, valu_phases[prev_phase_idx])
@@ -284,17 +347,30 @@ class KernelBuilder:
                     self.add_bundle({"valu": valu_ops[i:i+6]})
             prev_phase_idx += 1
 
+        # Overlap address computation with stores for final data
+        store_idx_addrs = [self.alloc_scratch() for _ in range(n_vectors)]
+        store_val_addrs = [self.alloc_scratch() for _ in range(n_vectors)]
+
+        # Compute first address
+        base0 = self.scratch_const(0)
+        self.add_bundle({"alu": [
+            ("+", store_idx_addrs[0], self.scratch["inp_indices_p"], base0),
+            ("+", store_val_addrs[0], self.scratch["inp_values_p"], base0)
+        ]})
+
+        # Pipeline: store[vi] while computing addr[vi+1]
         for vi in range(n_vectors):
-            base = self.scratch_const(vi * VLEN)
-            idx_addr, val_addr = self.alloc_scratch(), self.alloc_scratch()
-            self.add_bundle({"alu": [
-                ("+", idx_addr, self.scratch["inp_indices_p"], base),
-                ("+", val_addr, self.scratch["inp_values_p"], base)
-            ]})
-            self.add_bundle({"store": [
-                ("vstore", idx_addr, all_idx[vi]),
-                ("vstore", val_addr, all_val[vi])
-            ]})
+            bundle = {"store": [
+                ("vstore", store_idx_addrs[vi], all_idx[vi]),
+                ("vstore", store_val_addrs[vi], all_val[vi])
+            ]}
+            if vi + 1 < n_vectors:
+                base_next = self.scratch_const((vi + 1) * VLEN)
+                bundle["alu"] = [
+                    ("+", store_idx_addrs[vi+1], self.scratch["inp_indices_p"], base_next),
+                    ("+", store_val_addrs[vi+1], self.scratch["inp_values_p"], base_next)
+                ]
+            self.add_bundle(bundle)
 
         self.instrs.append({"flow": [("pause",)]})
 
