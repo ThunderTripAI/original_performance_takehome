@@ -117,8 +117,16 @@ class KernelBuilder:
         zero_const = self.scratch_const(0)
 
         hash_consts_v = []
-        for (op1, val1, op2, op3, val3) in HASH_STAGES:
+        hash_mult_v = []  # For multiply_add optimization
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             hash_consts_v.append((self.scratch_vconst(val1), self.scratch_vconst(val3)))
+            # Stages 0, 2, 4 can use multiply_add: a = a * (1 + 2^shift) + const
+            # because they have pattern: (a + const) + (a << shift)
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                mult = 1 + (1 << val3)  # e.g., 1 + 4096 = 4097 for shift=12
+                hash_mult_v.append(self.scratch_vconst(mult))
+            else:
+                hash_mult_v.append(None)
 
         zero_v = self.scratch_vconst(0)
         one_v = self.scratch_vconst(1)
@@ -182,13 +190,23 @@ class KernelBuilder:
                 part = int(phase.split("_")[2])
                 op1, val1, op2, op3, val3 = HASH_STAGES[hi]
                 v1, v3 = hash_consts_v[hi]
-                if part == 0:
-                    for slot, v_idx, v_val in iters:
-                        ops.append((op1, v_tmp1[buf][slot], v_val, v1))
-                        ops.append((op3, v_tmp2[buf][slot], v_val, v3))
+                mult_v = hash_mult_v[hi]
+
+                # Use multiply_add for stages with pattern (a + const) + (a << shift)
+                if mult_v is not None:
+                    if part == 0:
+                        # multiply_add: val = val * mult + const
+                        for slot, v_idx, v_val in iters:
+                            ops.append(("multiply_add", v_val, v_val, mult_v, v1))
+                    # Part 1 is not needed - multiply_add does it all in one op
                 else:
-                    for slot, v_idx, v_val in iters:
-                        ops.append((op2, v_val, v_tmp1[buf][slot], v_tmp2[buf][slot]))
+                    if part == 0:
+                        for slot, v_idx, v_val in iters:
+                            ops.append((op1, v_tmp1[buf][slot], v_val, v1))
+                            ops.append((op3, v_tmp2[buf][slot], v_val, v3))
+                    else:
+                        for slot, v_idx, v_val in iters:
+                            ops.append((op2, v_val, v_tmp1[buf][slot], v_tmp2[buf][slot]))
             elif phase.startswith("idx_"):
                 step = int(phase.split("_")[1])
                 for slot, v_idx, v_val in iters:
@@ -204,7 +222,9 @@ class KernelBuilder:
         valu_phases = ["xor"]
         for hi in range(6):
             valu_phases.append(f"hash_{hi}_0")
-            valu_phases.append(f"hash_{hi}_1")
+            # Skip part 1 for multiply_add stages (they do it all in part 0)
+            if hash_mult_v[hi] is None:
+                valu_phases.append(f"hash_{hi}_1")
         for step in range(7):
             valu_phases.append(f"idx_{step}")
 
