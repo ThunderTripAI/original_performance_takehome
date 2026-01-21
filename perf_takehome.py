@@ -210,13 +210,13 @@ class KernelBuilder:
             elif phase.startswith("idx_"):
                 step = int(phase.split("_")[1])
                 for slot, v_idx, v_val in iters:
-                    if step == 0: ops.append(("&", v_tmp1[buf][slot], v_val, one_v))
-                    elif step == 1: ops.append(("==", v_tmp1[buf][slot], v_tmp1[buf][slot], zero_v))
-                    elif step == 2: ops.append(("-", v_tmp2[buf][slot], two_v, v_tmp1[buf][slot]))
-                    elif step == 3: ops.append(("<<", v_idx, v_idx, one_v))
-                    elif step == 4: ops.append(("+", v_idx, v_idx, v_tmp2[buf][slot]))
-                    elif step == 5: ops.append(("<", v_tmp1[buf][slot], v_idx, n_nodes_v))
-                    elif step == 6: ops.append(("*", v_idx, v_idx, v_tmp1[buf][slot]))
+                    # Simplified: add = 1 + (val & 1) gives 1 if even, 2 if odd
+                    if step == 0: ops.append(("&", v_tmp1[buf][slot], v_val, one_v))  # tmp1 = val & 1
+                    elif step == 1: ops.append(("+", v_tmp1[buf][slot], v_tmp1[buf][slot], one_v))  # tmp1 = tmp1 + 1
+                    elif step == 2: ops.append(("<<", v_idx, v_idx, one_v))  # idx = idx * 2
+                    elif step == 3: ops.append(("+", v_idx, v_idx, v_tmp1[buf][slot]))  # idx = idx + tmp1
+                    elif step == 4: ops.append(("<", v_tmp1[buf][slot], v_idx, n_nodes_v))  # tmp1 = idx < n_nodes
+                    elif step == 5: ops.append(("*", v_idx, v_idx, v_tmp1[buf][slot]))  # idx = idx * tmp1 (wrap)
             return ops
 
         valu_phases = ["xor"]
@@ -225,7 +225,7 @@ class KernelBuilder:
             # Skip part 1 for multiply_add stages (they do it all in part 0)
             if hash_mult_v[hi] is None:
                 valu_phases.append(f"hash_{hi}_1")
-        for step in range(7):
+        for step in range(6):  # Simplified from 7 to 6 steps
             valu_phases.append(f"idx_{step}")
 
         prev_buf = None
