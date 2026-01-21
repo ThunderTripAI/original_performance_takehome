@@ -451,35 +451,71 @@ class KernelBuilder:
             prev_iters = iters
             prev_phase_idx = 0
 
-        # Handle final group's gather ALU and VALU
-        for i in range(0, len(prev_gather_alu), 12):
-            self.add_bundle({"alu": prev_gather_alu[i:i+12]})
+        # Pre-allocate store addresses
+        store_idx_addrs = [self.scratch["inp_indices_p"]] + [self.alloc_scratch() for _ in range(n_vectors - 1)]
+        store_val_addrs = [self.scratch["inp_values_p"]] + [self.alloc_scratch() for _ in range(n_vectors - 1)]
 
+        # Precompute all store address ALU ops
+        store_addr_alu = []
+        for vi in range(1, n_vectors):  # vi=0 uses base pointers directly
+            base = self.const_map[vi * VLEN]
+            store_addr_alu.append(("+", store_idx_addrs[vi], self.scratch["inp_indices_p"], base))
+            store_addr_alu.append(("+", store_val_addrs[vi], self.scratch["inp_values_p"], base))
+        store_addr_idx = 0
+
+        # Vectors that are ready after main loop (all except those in final group)
+        # Final group processes round 15, vi = (510 % 32, 511 % 32) = (30, 31)
+        final_vi = set()
+        for slot, v_idx, v_val in prev_iters:
+            for vi in range(n_vectors):
+                if all_idx[vi] == v_idx:
+                    final_vi.add(vi)
+                    break
+        ready_vi = [vi for vi in range(n_vectors) if vi not in final_vi]
+
+        # Handle final group's gather ALU with store addr computation
+        gather_idx = 0
+        for i in range(0, len(prev_gather_alu), 12):
+            bundle = {"alu": prev_gather_alu[i:i+12]}
+            self.add_bundle(bundle)
+
+        # Handle final group's VALU with overlapped store addr computation and early stores
+        store_vi_idx = 0
         while prev_buf is not None and prev_phase_idx < len(valu_phases):
             valu_ops = emit_valu_for_group(prev_buf, prev_iters, valu_phases[prev_phase_idx])
             if valu_ops:
                 for i in range(0, len(valu_ops), 6):
-                    self.add_bundle({"valu": valu_ops[i:i+6]})
+                    bundle = {"valu": valu_ops[i:i+6]}
+                    # Overlap with store addr computation
+                    if store_addr_idx < len(store_addr_alu):
+                        bundle["alu"] = store_addr_alu[store_addr_idx:store_addr_idx+12]
+                        store_addr_idx += 12
+                    # Overlap with early stores for ready vectors
+                    if store_vi_idx < len(ready_vi):
+                        vi = ready_vi[store_vi_idx]
+                        # Check if this vi's address is ready
+                        if vi == 0 or store_addr_idx >= vi * 2:
+                            bundle["store"] = [
+                                ("vstore", store_idx_addrs[vi], all_idx[vi]),
+                                ("vstore", store_val_addrs[vi], all_val[vi])
+                            ]
+                            store_vi_idx += 1
+                    self.add_bundle(bundle)
             prev_phase_idx += 1
 
-        # Overlap address computation with stores for final data
-        # For vi=0, use inp_indices_p and inp_values_p directly
-        store_idx_addrs = [self.scratch["inp_indices_p"]] + [self.alloc_scratch() for _ in range(n_vectors - 1)]
-        store_val_addrs = [self.scratch["inp_values_p"]] + [self.alloc_scratch() for _ in range(n_vectors - 1)]
+        # Handle remaining store address computation
+        while store_addr_idx < len(store_addr_alu):
+            self.add_bundle({"alu": store_addr_alu[store_addr_idx:store_addr_idx+12]})
+            store_addr_idx += 12
 
-        # Pipeline: store[vi] while computing addr[vi+1]
+        # Store remaining ready vectors and final vectors
+        stored = set(ready_vi[:store_vi_idx])
         for vi in range(n_vectors):
-            bundle = {"store": [
-                ("vstore", store_idx_addrs[vi], all_idx[vi]),
-                ("vstore", store_val_addrs[vi], all_val[vi])
-            ]}
-            if vi + 1 < n_vectors:
-                base_next = self.const_map[(vi + 1) * VLEN]
-                bundle["alu"] = [
-                    ("+", store_idx_addrs[vi+1], self.scratch["inp_indices_p"], base_next),
-                    ("+", store_val_addrs[vi+1], self.scratch["inp_values_p"], base_next)
-                ]
-            self.add_bundle(bundle)
+            if vi not in stored:
+                self.add_bundle({"store": [
+                    ("vstore", store_idx_addrs[vi], all_idx[vi]),
+                    ("vstore", store_val_addrs[vi], all_val[vi])
+                ]})
 
         self.instrs.append({"flow": [("pause",)]})
 
