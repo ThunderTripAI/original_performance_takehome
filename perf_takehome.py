@@ -76,6 +76,23 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
+    def batch_scratch_consts(self, values):
+        """Batch load multiple constants using 2 load slots per cycle"""
+        new_vals = [v for v in values if v not in self.const_map]
+        # Allocate addresses for new values
+        for v in new_vals:
+            self.const_map[v] = self.alloc_scratch()
+        # Batch load 2 at a time
+        for i in range(0, len(new_vals), 2):
+            if i + 1 < len(new_vals):
+                self.add_bundle({"load": [
+                    ("const", self.const_map[new_vals[i]], new_vals[i]),
+                    ("const", self.const_map[new_vals[i + 1]], new_vals[i + 1])
+                ]})
+            else:
+                self.add("load", ("const", self.const_map[new_vals[i]], new_vals[i]))
+        return [self.const_map[v] for v in values]
+
     def scratch_vconst(self, val, name=None):
         """Allocate a vector constant (broadcast scalar to 8 elements)"""
         if val not in self.vconst_map:
@@ -103,6 +120,7 @@ class KernelBuilder:
         Pipelined kernel: overlap loads of group N with VALU of group N-1.
         """
         tmp1 = self.alloc_scratch("tmp1")
+        tmp2 = self.alloc_scratch("tmp2")
 
         init_vars = [
             "rounds", "n_nodes", "batch_size", "forest_height",
@@ -110,32 +128,53 @@ class KernelBuilder:
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
 
-        zero_const = self.scratch_const(0)
+        # Batch init var loads: 2 loads per cycle using 2 temp addresses
+        for i in range(0, len(init_vars), 2):
+            if i + 1 < len(init_vars):
+                self.add_bundle({"load": [
+                    ("const", tmp1, i),
+                    ("const", tmp2, i + 1)
+                ]})
+                self.add_bundle({"load": [
+                    ("load", self.scratch[init_vars[i]], tmp1),
+                    ("load", self.scratch[init_vars[i + 1]], tmp2)
+                ]})
+            else:
+                self.add("load", ("const", tmp1, i))
+                self.add("load", ("load", self.scratch[init_vars[i]], tmp1))
 
-        # Pre-allocate all scalar constants needed for hash (load phase)
+        # Collect all scalar constants needed and batch load them
+        all_const_values = [0, 1, 2]  # zero, one, two
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            all_const_values.append(val1)
+            all_const_values.append(val3)
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                mult = 1 + (1 << val3)
+                all_const_values.append(mult)
+
+        # Batch load all constants (2 per cycle)
+        self.batch_scratch_consts(all_const_values)
+
+        # Now get the addresses (they're already loaded and cached)
+        zero_const = self.const_map[0]
         hash_scalar_consts = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            sc1 = self.scratch_const(val1)
-            sc3 = self.scratch_const(val3)
+            sc1 = self.const_map[val1]
+            sc3 = self.const_map[val3]
             hash_scalar_consts.append((sc1, sc3))
 
-        # Pre-allocate multiply constants
         hash_mult_scalars = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             if op1 == "+" and op2 == "+" and op3 == "<<":
                 mult = 1 + (1 << val3)
-                hash_mult_scalars.append(self.scratch_const(mult))
+                hash_mult_scalars.append(self.const_map[mult])
             else:
                 hash_mult_scalars.append(None)
 
-        # Pre-allocate other scalar constants
-        zero_scalar = self.scratch_const(0)
-        one_scalar = self.scratch_const(1)
-        two_scalar = self.scratch_const(2)
+        zero_scalar = self.const_map[0]
+        one_scalar = self.const_map[1]
+        two_scalar = self.const_map[2]
 
         # Allocate vector destinations (no instructions yet)
         hash_consts_v = []
@@ -328,7 +367,7 @@ class KernelBuilder:
                 gather_idx += 12
                 self.add_bundle(bundle)
 
-            # Phase 2: Overlap loads with VALU
+            # Phase 2: Overlap loads with VALU AND address ALU (all 3 engines in parallel)
             while load_idx < len(all_loads) and prev_buf is not None and prev_phase_idx < len(valu_phases):
                 bundle = {}
                 bundle["load"] = all_loads[load_idx:load_idx+2]
@@ -344,9 +383,14 @@ class KernelBuilder:
                         prev_phase_idx += 1
                         valu_op_offset = 0
 
+                # Also overlap address ALU for next group
+                if next_addr_idx < len(next_addr_alu):
+                    bundle["alu"] = next_addr_alu[next_addr_idx:next_addr_idx+12]
+                    next_addr_idx += 12
+
                 self.add_bundle(bundle)
 
-            # Phase 3: Overlap remaining loads with next group's address ALU
+            # Phase 3: Overlap remaining loads with any remaining address ALU
             while load_idx < len(all_loads):
                 bundle = {}
                 bundle["load"] = all_loads[load_idx:load_idx+2]
