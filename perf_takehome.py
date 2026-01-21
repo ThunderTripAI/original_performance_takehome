@@ -116,23 +116,58 @@ class KernelBuilder:
 
         zero_const = self.scratch_const(0)
 
-        hash_consts_v = []
-        hash_mult_v = []  # For multiply_add optimization
+        # Pre-allocate all scalar constants needed for hash (load phase)
+        hash_scalar_consts = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            hash_consts_v.append((self.scratch_vconst(val1), self.scratch_vconst(val3)))
-            # Stages 0, 2, 4 can use multiply_add: a = a * (1 + 2^shift) + const
-            # because they have pattern: (a + const) + (a << shift)
+            sc1 = self.scratch_const(val1)
+            sc3 = self.scratch_const(val3)
+            hash_scalar_consts.append((sc1, sc3))
+
+        # Pre-allocate multiply constants
+        hash_mult_scalars = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             if op1 == "+" and op2 == "+" and op3 == "<<":
-                mult = 1 + (1 << val3)  # e.g., 1 + 4096 = 4097 for shift=12
-                hash_mult_v.append(self.scratch_vconst(mult))
+                mult = 1 + (1 << val3)
+                hash_mult_scalars.append(self.scratch_const(mult))
+            else:
+                hash_mult_scalars.append(None)
+
+        # Pre-allocate other scalar constants
+        zero_scalar = self.scratch_const(0)
+        one_scalar = self.scratch_const(1)
+        two_scalar = self.scratch_const(2)
+
+        # Allocate vector destinations (no instructions yet)
+        hash_consts_v = []
+        hash_mult_v = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            v1 = self.alloc_scratch(None, VLEN)
+            v3 = self.alloc_scratch(None, VLEN)
+            hash_consts_v.append((v1, v3))
+            if hash_mult_scalars[hi] is not None:
+                vm = self.alloc_scratch(None, VLEN)
+                hash_mult_v.append(vm)
             else:
                 hash_mult_v.append(None)
 
-        zero_v = self.scratch_vconst(0)
-        one_v = self.scratch_vconst(1)
-        two_v = self.scratch_vconst(2)
+        zero_v = self.alloc_scratch(None, VLEN)
+        one_v = self.alloc_scratch(None, VLEN)
+        two_v = self.alloc_scratch(None, VLEN)
         n_nodes_v = self.alloc_scratch("n_nodes_v", VLEN)
-        self.add("valu", ("vbroadcast", n_nodes_v, self.scratch["n_nodes"]))
+
+        # Collect all vbroadcast ops (will be overlapped with initial data loads)
+        pending_vbroadcasts = []
+        for hi in range(len(HASH_STAGES)):
+            v1, v3 = hash_consts_v[hi]
+            sc1, sc3 = hash_scalar_consts[hi]
+            pending_vbroadcasts.append(("vbroadcast", v1, sc1))
+            pending_vbroadcasts.append(("vbroadcast", v3, sc3))
+            if hash_mult_v[hi] is not None:
+                pending_vbroadcasts.append(("vbroadcast", hash_mult_v[hi], hash_mult_scalars[hi]))
+        pending_vbroadcasts.append(("vbroadcast", zero_v, zero_scalar))
+        pending_vbroadcasts.append(("vbroadcast", one_v, one_scalar))
+        pending_vbroadcasts.append(("vbroadcast", two_v, two_scalar))
+        pending_vbroadcasts.append(("vbroadcast", n_nodes_v, self.scratch["n_nodes"]))
 
         n_vectors = batch_size // VLEN
         all_idx = [self.alloc_scratch(f"idx_{vi}", VLEN) for vi in range(n_vectors)]
@@ -146,7 +181,7 @@ class KernelBuilder:
         v_tmp1 = [[self.alloc_scratch(None, VLEN) for _ in range(GROUP_SIZE)] for _ in range(BUFFERS)]
         v_tmp2 = [[self.alloc_scratch(None, VLEN) for _ in range(GROUP_SIZE)] for _ in range(BUFFERS)]
 
-        # Overlap address computation with loads for initial data
+        # Overlap address computation AND vbroadcasts with loads for initial data
         idx_addrs = [self.alloc_scratch() for _ in range(n_vectors)]
         val_addrs = [self.alloc_scratch() for _ in range(n_vectors)]
 
@@ -157,7 +192,8 @@ class KernelBuilder:
             ("+", val_addrs[0], self.scratch["inp_values_p"], base0)
         ]})
 
-        # Pipeline: load[vi] while computing addr[vi+1]
+        # Pipeline: load[vi] while computing addr[vi+1] AND doing vbroadcasts
+        vb_idx = 0
         for vi in range(n_vectors):
             bundle = {"load": [
                 ("vload", all_idx[vi], idx_addrs[vi]),
@@ -169,7 +205,16 @@ class KernelBuilder:
                     ("+", idx_addrs[vi+1], self.scratch["inp_indices_p"], base_next),
                     ("+", val_addrs[vi+1], self.scratch["inp_values_p"], base_next)
                 ]
+            # Overlap vbroadcasts with loads (up to 6 per cycle)
+            if vb_idx < len(pending_vbroadcasts):
+                bundle["valu"] = pending_vbroadcasts[vb_idx:vb_idx+6]
+                vb_idx += 6
             self.add_bundle(bundle)
+
+        # Handle remaining vbroadcasts if any (shouldn't happen with 32 vectors and ~19 vbroadcasts)
+        while vb_idx < len(pending_vbroadcasts):
+            self.add_bundle({"valu": pending_vbroadcasts[vb_idx:vb_idx+6]})
+            vb_idx += 6
 
         self.add("flow", ("pause",))
 
