@@ -215,8 +215,9 @@ class KernelBuilder:
         GROUP_SIZE = 6
         BUFFERS = 2
         s_addr = [[[self.alloc_scratch() for _ in range(VLEN)] for _ in range(GROUP_SIZE)] for _ in range(BUFFERS)]
+        # Allocate s_node as contiguous blocks - s_node[buf][slot][0] can be used as vector base
         s_node = [[[self.alloc_scratch() for _ in range(VLEN)] for _ in range(GROUP_SIZE)] for _ in range(BUFFERS)]
-        v_node = [[self.alloc_scratch(None, VLEN) for _ in range(GROUP_SIZE)] for _ in range(BUFFERS)]
+        # v_node is no longer needed - use s_node[buf][slot][0] directly as vector base
         v_tmp1 = [[self.alloc_scratch(None, VLEN) for _ in range(GROUP_SIZE)] for _ in range(BUFFERS)]
         v_tmp2 = [[self.alloc_scratch(None, VLEN) for _ in range(GROUP_SIZE)] for _ in range(BUFFERS)]
 
@@ -314,7 +315,8 @@ class KernelBuilder:
             ops = []
             if phase == "xor":
                 for slot, v_idx, v_val in iters:
-                    ops.append(("^", v_val, v_val, v_node[buf][slot]))
+                    # Use s_node directly as vector base (contiguous allocation)
+                    ops.append(("^", v_val, v_val, s_node[buf][slot][0]))
             elif phase.startswith("hash_"):
                 hi = int(phase.split("_")[1])
                 part = int(phase.split("_")[2])
@@ -360,14 +362,13 @@ class KernelBuilder:
         prev_buf = None
         prev_iters = None
         prev_phase_idx = 0
-        prev_gather_alu = []  # Gather ALU ops from previous group
         # First group addresses already computed during data load phase
 
         for group in range(n_groups):
             buf = group % BUFFERS
             iters = get_group_iters(group, buf)
 
-            # Precompute next group's address ALU (will be overlapped with this group's tail loads)
+            # Precompute next group's address ALU (will be overlapped with this group's loads)
             next_addr_alu = []
             if group + 1 < n_groups:
                 next_buf = (group + 1) % BUFFERS
@@ -379,20 +380,10 @@ class KernelBuilder:
             all_loads = emit_loads_for_group(buf, iters)
 
             load_idx = 0
-            gather_idx = 0
             valu_op_offset = 0
             next_addr_idx = 0
 
-            # Phase 1: Overlap loads with gather ALU (until gather ALU completes)
-            while load_idx < len(all_loads) and gather_idx < len(prev_gather_alu):
-                bundle = {}
-                bundle["load"] = all_loads[load_idx:load_idx+2]
-                load_idx += 2
-                bundle["alu"] = prev_gather_alu[gather_idx:gather_idx+12]
-                gather_idx += 12
-                self.add_bundle(bundle)
-
-            # Phase 2: Overlap loads with VALU AND address ALU (all 3 engines in parallel)
+            # Overlap loads with VALU (prev group) AND address ALU (next group)
             while load_idx < len(all_loads) and prev_buf is not None and prev_phase_idx < len(valu_phases):
                 bundle = {}
                 bundle["load"] = all_loads[load_idx:load_idx+2]
@@ -441,11 +432,7 @@ class KernelBuilder:
                 self.add_bundle({"alu": next_addr_alu[next_addr_idx:next_addr_idx+12]})
                 next_addr_idx += 12
 
-            # Prepare gather ALU for this group
-            prev_gather_alu = []
-            for slot, v_idx, v_val in iters:
-                for j in range(VLEN):
-                    prev_gather_alu.append(("+", v_node[buf][slot] + j, s_node[buf][slot][j], zero_const))
+            # No gather ALU needed - s_node is used directly as vector base
 
             prev_buf = buf
             prev_iters = iters
@@ -473,11 +460,7 @@ class KernelBuilder:
                     break
         ready_vi = [vi for vi in range(n_vectors) if vi not in final_vi]
 
-        # Handle final group's gather ALU with store addr computation
-        gather_idx = 0
-        for i in range(0, len(prev_gather_alu), 12):
-            bundle = {"alu": prev_gather_alu[i:i+12]}
-            self.add_bundle(bundle)
+        # No final gather ALU - s_node is used directly
 
         # Handle final group's VALU with overlapped store addr computation and early stores
         store_vi_idx = 0
