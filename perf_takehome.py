@@ -262,40 +262,20 @@ class KernelBuilder:
             self.add_bundle({"valu": pending_vbroadcasts[vb_idx:vb_idx+6]})
             vb_idx += 6
 
-        # Broadcast tree[0] and compute round1 A and B
-        # tree_v_0 = broadcast(tree_val_0)
-        # A = 2*tree[1] - tree[2], B = tree[2] - tree[1]
-        # First broadcast tree values
+        # Broadcast tree[0] only - round 1 prep will be overlapped with round 0
         self.add_bundle({"valu": [
             ("vbroadcast", tree_v_0, tree_val_0),
-            ("vbroadcast", round1_A, tree_val_1),  # temp: will compute A = 2*tree[1] - tree[2]
-            ("vbroadcast", round1_B, tree_val_2),  # temp: will compute B = tree[2] - tree[1]
         ]})
-        # Compute A = 2*round1_A - round1_B = 2*tree[1] - tree[2]
-        # Compute B = round1_B - round1_A = tree[2] - tree[1]
-        # But first we need round1_A to contain tree[1] broadcast, round1_B to contain tree[2] broadcast
-        # Then: A = round1_A * 2 - round1_B, B = round1_B - round1_A
-        # Using multiply_add: can't directly do A in one op
-        # Let's use: tmp = round1_A * 2 (via <<1 or *2), then A = tmp - round1_B
-        # Actually, let's allocate more temps
+
+        # Allocate temps for round 1 prep
         tree_v_1 = self.alloc_scratch(None, VLEN)
         tree_v_2 = self.alloc_scratch(None, VLEN)
 
-        # Re-broadcast into proper locations
-        self.add_bundle({"valu": [
+        # Queue round 1 prep ops to be overlapped with round 0
+        round1_prep_ops = [
             ("vbroadcast", tree_v_1, tree_val_1),
             ("vbroadcast", tree_v_2, tree_val_2),
-        ]})
-
-        # Compute A and B for round 1 arithmetic
-        # A = 2*tree[1] - tree[2], B = tree[2] - tree[1]
-        self.add_bundle({"valu": [
-            ("*", round1_A, tree_v_1, two_v),  # round1_A = tree[1] * 2
-            ("-", round1_B, tree_v_2, tree_v_1),  # round1_B = tree[2] - tree[1]
-        ]})
-        self.add_bundle({"valu": [
-            ("-", round1_A, round1_A, tree_v_2),  # round1_A = 2*tree[1] - tree[2]
-        ]})
+        ]
 
         self.add("flow", ("pause",))
 
@@ -322,10 +302,10 @@ class KernelBuilder:
             ops.append(("*", v_idx, v_idx, v_tmp1))
             return ops
 
-        # Process round 0 in waves of GROUP_SIZE
+        # Collect all round 0 VALU bundles
+        round0_bundles = []
         for wave_start in range(0, n_vectors, GROUP_SIZE):
             wave_end = min(wave_start + GROUP_SIZE, n_vectors)
-            wave_size = wave_end - wave_start
 
             # Collect all ops for this wave, organized by dependency phase
             all_ops = []
@@ -342,9 +322,53 @@ class KernelBuilder:
                 for ops in all_ops:
                     if phase < len(ops):
                         phase_ops.append(ops[phase])
-                # Batch emit this phase
+                # Batch into bundles of 6
                 for i in range(0, len(phase_ops), 6):
-                    self.add_bundle({"valu": phase_ops[i:i+6]})
+                    round0_bundles.append(phase_ops[i:i+6])
+
+        # Overlap round 0 with round 1 prep
+        # Round 1 prep needs: broadcast tree_v_1, tree_v_2, then compute round1_A, round1_B
+        # These are few ops that can be interleaved with round 0
+        # Since round 0 uses 6 VALU slots per bundle, we can't add more to same bundle
+        # But we can insert prep ops in separate bundles that don't block round 0
+
+        # Emit first part of round0, then insert prep ops, then continue round0
+        # The prep ops: vbroadcast tree_v_1, tree_v_2 (can be in one bundle with round0 if slots available)
+        # Then: round1_A = tree_v_1 * two_v, round1_B = tree_v_2 - tree_v_1
+        # Then: round1_A = round1_A - tree_v_2
+
+        # Insert round1 prep as early as possible while round0 is running
+        prep_phase = 0
+        for bi, bundle in enumerate(round0_bundles):
+            if prep_phase == 0 and len(bundle) <= 4:
+                # Add vbroadcast ops to this bundle
+                bundle.extend(round1_prep_ops)
+                prep_phase = 1
+            elif prep_phase == 1 and len(bundle) <= 4:
+                # Add multiply and subtract
+                bundle.extend([
+                    ("*", round1_A, tree_v_1, two_v),
+                    ("-", round1_B, tree_v_2, tree_v_1),
+                ])
+                prep_phase = 2
+            elif prep_phase == 2 and len(bundle) <= 5:
+                # Add final subtract
+                bundle.append(("-", round1_A, round1_A, tree_v_2))
+                prep_phase = 3
+            self.add_bundle({"valu": bundle})
+
+        # If prep wasn't fully inserted (all bundles were full), emit remaining prep
+        if prep_phase == 0:
+            self.add_bundle({"valu": round1_prep_ops})
+            prep_phase = 1
+        if prep_phase == 1:
+            self.add_bundle({"valu": [
+                ("*", round1_A, tree_v_1, two_v),
+                ("-", round1_B, tree_v_2, tree_v_1),
+            ]})
+            prep_phase = 2
+        if prep_phase == 2:
+            self.add_bundle({"valu": [("-", round1_A, round1_A, tree_v_2)]})
 
         # ===== ROUND 1: Indices are 1 or 2 =====
         # node = round1_A + idx * round1_B (using multiply_add)
@@ -522,15 +546,7 @@ class KernelBuilder:
             prev_iters = iters
             prev_phase_idx = 0
 
-        # Final group VALU
-        while prev_buf is not None and prev_phase_idx < len(valu_phases):
-            valu_ops = emit_valu_for_group(prev_buf, prev_iters, valu_phases[prev_phase_idx])
-            if valu_ops:
-                for i in range(0, len(valu_ops), 6):
-                    self.add_bundle({"valu": valu_ops[i:i+6]})
-            prev_phase_idx += 1
-
-        # Store results
+        # Store results - pre-allocate addresses
         store_idx_addrs = [self.scratch["inp_indices_p"]] + [self.alloc_scratch() for _ in range(n_vectors - 1)]
         store_val_addrs = [self.scratch["inp_values_p"]] + [self.alloc_scratch() for _ in range(n_vectors - 1)]
 
@@ -540,8 +556,28 @@ class KernelBuilder:
             store_addr_alu.append(("+", store_idx_addrs[vi], self.scratch["inp_indices_p"], base))
             store_addr_alu.append(("+", store_val_addrs[vi], self.scratch["inp_values_p"], base))
 
-        for i in range(0, len(store_addr_alu), 12):
-            self.add_bundle({"alu": store_addr_alu[i:i+12]})
+        # Final group VALU overlapped with store address computation
+        final_valu_bundles = []
+        while prev_buf is not None and prev_phase_idx < len(valu_phases):
+            valu_ops = emit_valu_for_group(prev_buf, prev_iters, valu_phases[prev_phase_idx])
+            if valu_ops:
+                for i in range(0, len(valu_ops), 6):
+                    final_valu_bundles.append(valu_ops[i:i+6])
+            prev_phase_idx += 1
+
+        # Emit final VALU overlapped with store ALU
+        valu_idx = 0
+        alu_idx = 0
+        while valu_idx < len(final_valu_bundles) or alu_idx < len(store_addr_alu):
+            bundle = {}
+            if valu_idx < len(final_valu_bundles):
+                bundle["valu"] = final_valu_bundles[valu_idx]
+                valu_idx += 1
+            if alu_idx < len(store_addr_alu):
+                bundle["alu"] = store_addr_alu[alu_idx:alu_idx+12]
+                alu_idx += 12
+            if bundle:
+                self.add_bundle(bundle)
 
         for vi in range(n_vectors):
             self.add_bundle({"store": [
