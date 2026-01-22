@@ -47,7 +47,6 @@ class KernelBuilder:
         return DebugInfo(scratch_map=self.scratch_debug)
 
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
         instrs = []
         for engine, slot in slots:
             instrs.append({engine: [slot]})
@@ -79,10 +78,8 @@ class KernelBuilder:
     def batch_scratch_consts(self, values):
         """Batch load multiple constants using 2 load slots per cycle"""
         new_vals = [v for v in values if v not in self.const_map]
-        # Allocate addresses for new values
         for v in new_vals:
             self.const_map[v] = self.alloc_scratch()
-        # Batch load 2 at a time
         for i in range(0, len(new_vals), 2):
             if i + 1 < len(new_vals):
                 self.add_bundle({"load": [
@@ -93,31 +90,14 @@ class KernelBuilder:
                 self.add("load", ("const", self.const_map[new_vals[i]], new_vals[i]))
         return [self.const_map[v] for v in values]
 
-    def scratch_vconst(self, val, name=None):
-        """Allocate a vector constant (broadcast scalar to 8 elements)"""
-        if val not in self.vconst_map:
-            scalar_addr = self.scratch_const(val)
-            vec_addr = self.alloc_scratch(name, VLEN)
-            self.add("valu", ("vbroadcast", vec_addr, scalar_addr))
-            self.vconst_map[val] = vec_addr
-        return self.vconst_map[val]
-
-    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
-        slots = []
-
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
-
-        return slots
-
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Pipelined kernel: overlap loads of group N with VALU of group N-1.
+        Optimized kernel with specialized handling for rounds 0-1.
+        Round 0: All indices are 0 - use single tree[0] load
+        Round 1: Indices are 1 or 2 - use arithmetic: node = A + idx*B
+        Rounds 2+: Pipelined scatter-gather
         """
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
@@ -129,7 +109,6 @@ class KernelBuilder:
         for v in init_vars:
             self.alloc_scratch(v, 1)
 
-        # Batch init var loads: 2 loads per cycle using 2 temp addresses
         for i in range(0, len(init_vars), 2):
             if i + 1 < len(init_vars):
                 self.add_bundle({"load": [
@@ -144,8 +123,8 @@ class KernelBuilder:
                 self.add("load", ("const", tmp1, i))
                 self.add("load", ("load", self.scratch[init_vars[i]], tmp1))
 
-        # Collect all scalar constants needed and batch load them
-        all_const_values = [0, 1, 2]  # zero, one, two
+        # Collect all scalar constants
+        all_const_values = [0, 1, 2]
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             all_const_values.append(val1)
             all_const_values.append(val3)
@@ -153,10 +132,8 @@ class KernelBuilder:
                 mult = 1 + (1 << val3)
                 all_const_values.append(mult)
 
-        # Batch load all constants (2 per cycle)
         self.batch_scratch_consts(all_const_values)
 
-        # Now get the addresses (they're already loaded and cached)
         zero_const = self.const_map[0]
         hash_scalar_consts = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
@@ -176,7 +153,6 @@ class KernelBuilder:
         one_scalar = self.const_map[1]
         two_scalar = self.const_map[2]
 
-        # Allocate vector destinations (no instructions yet)
         hash_consts_v = []
         hash_mult_v = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
@@ -194,7 +170,18 @@ class KernelBuilder:
         two_v = self.alloc_scratch(None, VLEN)
         n_nodes_v = self.alloc_scratch("n_nodes_v", VLEN)
 
-        # Collect all vbroadcast ops (will be overlapped with initial data loads)
+        # Allocate tree values for rounds 0-1
+        tree_addr_0 = self.alloc_scratch()
+        tree_addr_1 = self.alloc_scratch()
+        tree_addr_2 = self.alloc_scratch()
+        tree_val_0 = self.alloc_scratch()  # scalar
+        tree_val_1 = self.alloc_scratch()
+        tree_val_2 = self.alloc_scratch()
+        tree_v_0 = self.alloc_scratch(None, VLEN)  # broadcast version
+        # For round 1: A = 2*tree[1] - tree[2], B = tree[2] - tree[1]
+        round1_A = self.alloc_scratch(None, VLEN)
+        round1_B = self.alloc_scratch(None, VLEN)
+
         pending_vbroadcasts = []
         for hi in range(len(HASH_STAGES)):
             v1, v3 = hash_consts_v[hi]
@@ -215,36 +202,42 @@ class KernelBuilder:
         GROUP_SIZE = 6
         BUFFERS = 2
         s_addr = [[[self.alloc_scratch() for _ in range(VLEN)] for _ in range(GROUP_SIZE)] for _ in range(BUFFERS)]
-        # Allocate s_node as contiguous blocks - s_node[buf][slot][0] can be used as vector base
         s_node = [[[self.alloc_scratch() for _ in range(VLEN)] for _ in range(GROUP_SIZE)] for _ in range(BUFFERS)]
-        # v_node is no longer needed - use s_node[buf][slot][0] directly as vector base
         v_tmp1 = [[self.alloc_scratch(None, VLEN) for _ in range(GROUP_SIZE)] for _ in range(BUFFERS)]
         v_tmp2 = [[self.alloc_scratch(None, VLEN) for _ in range(GROUP_SIZE)] for _ in range(BUFFERS)]
 
-        # Overlap address computation AND vbroadcasts with loads for initial data
-        # For vi=0, use inp_indices_p and inp_values_p directly (offset is 0)
-        # For vi>0, compute addresses on the fly
+        # Temp vectors for specialized rounds
+        spec_tmp1 = [self.alloc_scratch(None, VLEN) for _ in range(GROUP_SIZE)]
+        spec_tmp2 = [self.alloc_scratch(None, VLEN) for _ in range(GROUP_SIZE)]
+        spec_node = [self.alloc_scratch(None, VLEN) for _ in range(GROUP_SIZE)]
+
         idx_addrs = [self.scratch["inp_indices_p"]] + [self.alloc_scratch() for _ in range(n_vectors - 1)]
         val_addrs = [self.scratch["inp_values_p"]] + [self.alloc_scratch() for _ in range(n_vectors - 1)]
 
-        # Preload offset constants for data loading (8, 16, ..., 248) - skip 0 since it's not needed
         offset_consts = [vi * VLEN for vi in range(1, n_vectors)]
         self.batch_scratch_consts(offset_consts)
-        # Also ensure 0 is in const_map (might already be from all_const_values)
         if 0 not in self.const_map:
             self.scratch_const(0)
 
-        # Precompute first group address ALU ops (will be overlapped with data loads)
-        # For group 0, slot s uses all_idx[s], so we can compute after all_idx[s] is loaded
         forest_p = self.scratch["forest_values_p"]
-        first_group_addr_ops = []
-        for slot in range(GROUP_SIZE):
-            vi = slot  # For group 0, iteration uses vi = slot
-            for j in range(VLEN):
-                first_group_addr_ops.append((slot, ("+", s_addr[0][slot][j], forest_p, all_idx[vi] + j)))
-        first_addr_idx = 0
 
-        # Pipeline: load[vi] while computing addr[vi+1], vbroadcasts, AND first group addresses
+        # Compute tree addresses for indices 0, 1, 2
+        self.add_bundle({"alu": [
+            ("+", tree_addr_0, forest_p, zero_scalar),
+            ("+", tree_addr_1, forest_p, one_scalar),
+            ("+", tree_addr_2, forest_p, two_scalar)
+        ]})
+
+        # Load tree values (will overlap with data loading)
+        # First load tree[0] and tree[1]
+        self.add_bundle({"load": [
+            ("load", tree_val_0, tree_addr_0),
+            ("load", tree_val_1, tree_addr_1)
+        ]})
+        # Then tree[2]
+        self.add_bundle({"load": [("load", tree_val_2, tree_addr_2)]})
+
+        # Load input data and overlap with vbroadcasts
         vb_idx = 0
         for vi in range(n_vectors):
             bundle = {"load": [
@@ -252,47 +245,145 @@ class KernelBuilder:
                 ("vload", all_val[vi], val_addrs[vi])
             ]}
             alu_ops = []
-            # Compute address for vi+1 (vi=0 uses base pointers directly, so start computing at vi=0 for vi+1=1)
             if vi + 1 < n_vectors:
                 base_next = self.const_map[(vi + 1) * VLEN]
                 alu_ops.extend([
                     ("+", idx_addrs[vi+1], self.scratch["inp_indices_p"], base_next),
                     ("+", val_addrs[vi+1], self.scratch["inp_values_p"], base_next)
                 ])
-            # Add first group address ops for slots whose data has been loaded (vi-1 and earlier)
-            # After loading vi, all_idx[0..vi] are available, so we can compute addresses for slots 0..vi
-            while first_addr_idx < len(first_group_addr_ops) and len(alu_ops) < 12:
-                slot, op = first_group_addr_ops[first_addr_idx]
-                if slot < vi:  # slot's data (all_idx[slot]) was loaded in previous cycle
-                    alu_ops.append(op)
-                    first_addr_idx += 1
-                else:
-                    break
             if alu_ops:
                 bundle["alu"] = alu_ops
-            # Overlap vbroadcasts with loads (up to 6 per cycle)
             if vb_idx < len(pending_vbroadcasts):
                 bundle["valu"] = pending_vbroadcasts[vb_idx:vb_idx+6]
                 vb_idx += 6
             self.add_bundle(bundle)
 
-        # Handle remaining vbroadcasts if any
         while vb_idx < len(pending_vbroadcasts):
             self.add_bundle({"valu": pending_vbroadcasts[vb_idx:vb_idx+6]})
             vb_idx += 6
 
-        # Handle remaining first group address computation (if any slots weren't fully processed)
-        while first_addr_idx < len(first_group_addr_ops):
-            alu_ops = []
-            while first_addr_idx < len(first_group_addr_ops) and len(alu_ops) < 12:
-                slot, op = first_group_addr_ops[first_addr_idx]
-                alu_ops.append(op)
-                first_addr_idx += 1
-            self.add_bundle({"alu": alu_ops})
+        # Broadcast tree[0] and compute round1 A and B
+        # tree_v_0 = broadcast(tree_val_0)
+        # A = 2*tree[1] - tree[2], B = tree[2] - tree[1]
+        # First broadcast tree values
+        self.add_bundle({"valu": [
+            ("vbroadcast", tree_v_0, tree_val_0),
+            ("vbroadcast", round1_A, tree_val_1),  # temp: will compute A = 2*tree[1] - tree[2]
+            ("vbroadcast", round1_B, tree_val_2),  # temp: will compute B = tree[2] - tree[1]
+        ]})
+        # Compute A = 2*round1_A - round1_B = 2*tree[1] - tree[2]
+        # Compute B = round1_B - round1_A = tree[2] - tree[1]
+        # But first we need round1_A to contain tree[1] broadcast, round1_B to contain tree[2] broadcast
+        # Then: A = round1_A * 2 - round1_B, B = round1_B - round1_A
+        # Using multiply_add: can't directly do A in one op
+        # Let's use: tmp = round1_A * 2 (via <<1 or *2), then A = tmp - round1_B
+        # Actually, let's allocate more temps
+        tree_v_1 = self.alloc_scratch(None, VLEN)
+        tree_v_2 = self.alloc_scratch(None, VLEN)
+
+        # Re-broadcast into proper locations
+        self.add_bundle({"valu": [
+            ("vbroadcast", tree_v_1, tree_val_1),
+            ("vbroadcast", tree_v_2, tree_val_2),
+        ]})
+
+        # Compute A and B for round 1 arithmetic
+        # A = 2*tree[1] - tree[2], B = tree[2] - tree[1]
+        self.add_bundle({"valu": [
+            ("*", round1_A, tree_v_1, two_v),  # round1_A = tree[1] * 2
+            ("-", round1_B, tree_v_2, tree_v_1),  # round1_B = tree[2] - tree[1]
+        ]})
+        self.add_bundle({"valu": [
+            ("-", round1_A, round1_A, tree_v_2),  # round1_A = 2*tree[1] - tree[2]
+        ]})
 
         self.add("flow", ("pause",))
 
-        total_iters = rounds * n_vectors
+        # ===== ROUND 0: All indices are 0 =====
+        # tree[0] is in tree_v_0, all indices start at 0
+        # Process in waves to avoid temp conflicts
+        def emit_hash_index_ops(v_val, v_idx, v_node, v_tmp1, v_tmp2):
+            """Return list of (op, dest, src1, src2, [src3]) tuples for hash+index update."""
+            ops = []
+            ops.append(("^", v_val, v_val, v_node))
+            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                v1, v3 = hash_consts_v[hi]
+                mult_v = hash_mult_v[hi]
+                if mult_v is not None:
+                    ops.append(("multiply_add", v_val, v_val, mult_v, v1))
+                else:
+                    ops.append((op1, v_tmp1, v_val, v1))
+                    ops.append((op3, v_tmp2, v_val, v3))
+                    ops.append((op2, v_val, v_tmp1, v_tmp2))
+            ops.append(("&", v_tmp1, v_val, one_v))
+            ops.append(("+", v_tmp1, v_tmp1, one_v))
+            ops.append(("multiply_add", v_idx, v_idx, two_v, v_tmp1))
+            ops.append(("<", v_tmp1, v_idx, n_nodes_v))
+            ops.append(("*", v_idx, v_idx, v_tmp1))
+            return ops
+
+        # Process round 0 in waves of GROUP_SIZE
+        for wave_start in range(0, n_vectors, GROUP_SIZE):
+            wave_end = min(wave_start + GROUP_SIZE, n_vectors)
+            wave_size = wave_end - wave_start
+
+            # Collect all ops for this wave, organized by dependency phase
+            all_ops = []
+            for i, vi in enumerate(range(wave_start, wave_end)):
+                slot = i  # Use slot within wave
+                ops = emit_hash_index_ops(all_val[vi], all_idx[vi], tree_v_0,
+                                          spec_tmp1[slot], spec_tmp2[slot])
+                all_ops.append(ops)
+
+            # Emit phase by phase to respect dependencies
+            max_ops = max(len(ops) for ops in all_ops) if all_ops else 0
+            for phase in range(max_ops):
+                phase_ops = []
+                for ops in all_ops:
+                    if phase < len(ops):
+                        phase_ops.append(ops[phase])
+                # Batch emit this phase
+                for i in range(0, len(phase_ops), 6):
+                    self.add_bundle({"valu": phase_ops[i:i+6]})
+
+        # ===== ROUND 1: Indices are 1 or 2 =====
+        # node = round1_A + idx * round1_B (using multiply_add)
+        for wave_start in range(0, n_vectors, GROUP_SIZE):
+            wave_end = min(wave_start + GROUP_SIZE, n_vectors)
+
+            # Phase 1: Compute node = A + idx * B for all vectors in wave
+            node_ops = []
+            for i, vi in enumerate(range(wave_start, wave_end)):
+                slot = i
+                # multiply_add: spec_node[slot] = all_idx[vi] * round1_B + round1_A
+                node_ops.append(("multiply_add", spec_node[slot], all_idx[vi], round1_B, round1_A))
+            for i in range(0, len(node_ops), 6):
+                self.add_bundle({"valu": node_ops[i:i+6]})
+
+            # Phase 2+: Hash and index update
+            all_ops = []
+            for i, vi in enumerate(range(wave_start, wave_end)):
+                slot = i
+                ops = emit_hash_index_ops(all_val[vi], all_idx[vi], spec_node[slot],
+                                          spec_tmp1[slot], spec_tmp2[slot])
+                all_ops.append(ops)
+
+            max_ops = max(len(ops) for ops in all_ops) if all_ops else 0
+            for phase in range(max_ops):
+                phase_ops = []
+                for ops in all_ops:
+                    if phase < len(ops):
+                        phase_ops.append(ops[phase])
+                for i in range(0, len(phase_ops), 6):
+                    self.add_bundle({"valu": phase_ops[i:i+6]})
+
+        # ===== ROUNDS 2-15: Pipelined scatter-gather =====
+        # Now indices can be anywhere, use standard approach
+        # But we need to compute addresses for the FIRST group of round 2
+
+        start_round = 2
+        remaining_rounds = rounds - start_round
+        total_iters = remaining_rounds * n_vectors
         n_groups = (total_iters + GROUP_SIZE - 1) // GROUP_SIZE
 
         def get_group_iters(group_idx, buf):
@@ -315,7 +406,6 @@ class KernelBuilder:
             ops = []
             if phase == "xor":
                 for slot, v_idx, v_val in iters:
-                    # Use s_node directly as vector base (contiguous allocation)
                     ops.append(("^", v_val, v_val, s_node[buf][slot][0]))
             elif phase.startswith("hash_"):
                 hi = int(phase.split("_")[1])
@@ -323,14 +413,10 @@ class KernelBuilder:
                 op1, val1, op2, op3, val3 = HASH_STAGES[hi]
                 v1, v3 = hash_consts_v[hi]
                 mult_v = hash_mult_v[hi]
-
-                # Use multiply_add for stages with pattern (a + const) + (a << shift)
                 if mult_v is not None:
                     if part == 0:
-                        # multiply_add: val = val * mult + const
                         for slot, v_idx, v_val in iters:
                             ops.append(("multiply_add", v_val, v_val, mult_v, v1))
-                    # Part 1 is not needed - multiply_add does it all in one op
                 else:
                     if part == 0:
                         for slot, v_idx, v_val in iters:
@@ -342,33 +428,38 @@ class KernelBuilder:
             elif phase.startswith("idx_"):
                 step = int(phase.split("_")[1])
                 for slot, v_idx, v_val in iters:
-                    # Use multiply_add to combine idx*2 + tmp in one op
-                    if step == 0: ops.append(("&", v_tmp1[buf][slot], v_val, one_v))  # tmp1 = val & 1
-                    elif step == 1: ops.append(("+", v_tmp1[buf][slot], v_tmp1[buf][slot], one_v))  # tmp1 = tmp1 + 1
-                    elif step == 2: ops.append(("multiply_add", v_idx, v_idx, two_v, v_tmp1[buf][slot]))  # idx = idx*2 + tmp
-                    elif step == 3: ops.append(("<", v_tmp1[buf][slot], v_idx, n_nodes_v))  # tmp1 = idx < n_nodes
-                    elif step == 4: ops.append(("*", v_idx, v_idx, v_tmp1[buf][slot]))  # idx = idx * tmp1 (wrap)
+                    if step == 0: ops.append(("&", v_tmp1[buf][slot], v_val, one_v))
+                    elif step == 1: ops.append(("+", v_tmp1[buf][slot], v_tmp1[buf][slot], one_v))
+                    elif step == 2: ops.append(("multiply_add", v_idx, v_idx, two_v, v_tmp1[buf][slot]))
+                    elif step == 3: ops.append(("<", v_tmp1[buf][slot], v_idx, n_nodes_v))
+                    elif step == 4: ops.append(("*", v_idx, v_idx, v_tmp1[buf][slot]))
             return ops
 
         valu_phases = ["xor"]
         for hi in range(6):
             valu_phases.append(f"hash_{hi}_0")
-            # Skip part 1 for multiply_add stages (they do it all in part 0)
             if hash_mult_v[hi] is None:
                 valu_phases.append(f"hash_{hi}_1")
-        for step in range(5):  # Reduced from 6 to 5 steps using multiply_add
+        for step in range(5):
             valu_phases.append(f"idx_{step}")
+
+        # Compute addresses for first group of round 2+
+        first_group_iters = get_group_iters(0, 0)
+        first_addr_ops = []
+        for slot, v_idx, v_val in first_group_iters:
+            for j in range(VLEN):
+                first_addr_ops.append(("+", s_addr[0][slot][j], forest_p, v_idx + j))
+        for i in range(0, len(first_addr_ops), 12):
+            self.add_bundle({"alu": first_addr_ops[i:i+12]})
 
         prev_buf = None
         prev_iters = None
         prev_phase_idx = 0
-        # First group addresses already computed during data load phase
 
         for group in range(n_groups):
             buf = group % BUFFERS
             iters = get_group_iters(group, buf)
 
-            # Precompute next group's address ALU (will be overlapped with this group's loads)
             next_addr_alu = []
             if group + 1 < n_groups:
                 next_buf = (group + 1) % BUFFERS
@@ -383,7 +474,6 @@ class KernelBuilder:
             valu_op_offset = 0
             next_addr_idx = 0
 
-            # Overlap loads with VALU (prev group) AND address ALU (next group)
             while load_idx < len(all_loads) and prev_buf is not None and prev_phase_idx < len(valu_phases):
                 bundle = {}
                 bundle["load"] = all_loads[load_idx:load_idx+2]
@@ -399,14 +489,12 @@ class KernelBuilder:
                         prev_phase_idx += 1
                         valu_op_offset = 0
 
-                # Also overlap address ALU for next group
                 if next_addr_idx < len(next_addr_alu):
                     bundle["alu"] = next_addr_alu[next_addr_idx:next_addr_idx+12]
                     next_addr_idx += 12
 
                 self.add_bundle(bundle)
 
-            # Phase 3: Overlap remaining loads with any remaining address ALU
             while load_idx < len(all_loads):
                 bundle = {}
                 bundle["load"] = all_loads[load_idx:load_idx+2]
@@ -418,89 +506,51 @@ class KernelBuilder:
 
                 self.add_bundle(bundle)
 
-            # Handle remaining VALU after loads complete (continue from valu_op_offset)
             while prev_buf is not None and prev_phase_idx < len(valu_phases):
                 valu_ops = emit_valu_for_group(prev_buf, prev_iters, valu_phases[prev_phase_idx])
                 if valu_ops:
                     for i in range(valu_op_offset, len(valu_ops), 6):
                         self.add_bundle({"valu": valu_ops[i:i+6]})
                 prev_phase_idx += 1
-                valu_op_offset = 0  # Reset offset for subsequent phases
+                valu_op_offset = 0
 
-            # Handle remaining address ALU if not all overlapped
             while next_addr_idx < len(next_addr_alu):
                 self.add_bundle({"alu": next_addr_alu[next_addr_idx:next_addr_idx+12]})
                 next_addr_idx += 12
-
-            # No gather ALU needed - s_node is used directly as vector base
 
             prev_buf = buf
             prev_iters = iters
             prev_phase_idx = 0
 
-        # Pre-allocate store addresses
-        store_idx_addrs = [self.scratch["inp_indices_p"]] + [self.alloc_scratch() for _ in range(n_vectors - 1)]
-        store_val_addrs = [self.scratch["inp_values_p"]] + [self.alloc_scratch() for _ in range(n_vectors - 1)]
-
-        # Precompute all store address ALU ops
-        store_addr_alu = []
-        for vi in range(1, n_vectors):  # vi=0 uses base pointers directly
-            base = self.const_map[vi * VLEN]
-            store_addr_alu.append(("+", store_idx_addrs[vi], self.scratch["inp_indices_p"], base))
-            store_addr_alu.append(("+", store_val_addrs[vi], self.scratch["inp_values_p"], base))
-        store_addr_idx = 0
-
-        # Vectors that are ready after main loop (all except those in final group)
-        # Final group processes round 15, vi = (510 % 32, 511 % 32) = (30, 31)
-        final_vi = set()
-        for slot, v_idx, v_val in prev_iters:
-            for vi in range(n_vectors):
-                if all_idx[vi] == v_idx:
-                    final_vi.add(vi)
-                    break
-        ready_vi = [vi for vi in range(n_vectors) if vi not in final_vi]
-
-        # No final gather ALU - s_node is used directly
-
-        # Handle final group's VALU with overlapped store addr computation and early stores
-        store_vi_idx = 0
+        # Final group VALU
         while prev_buf is not None and prev_phase_idx < len(valu_phases):
             valu_ops = emit_valu_for_group(prev_buf, prev_iters, valu_phases[prev_phase_idx])
             if valu_ops:
                 for i in range(0, len(valu_ops), 6):
-                    bundle = {"valu": valu_ops[i:i+6]}
-                    # Overlap with store addr computation
-                    if store_addr_idx < len(store_addr_alu):
-                        bundle["alu"] = store_addr_alu[store_addr_idx:store_addr_idx+12]
-                        store_addr_idx += 12
-                    # Overlap with early stores for ready vectors
-                    if store_vi_idx < len(ready_vi):
-                        vi = ready_vi[store_vi_idx]
-                        # Check if this vi's address is ready
-                        if vi == 0 or store_addr_idx >= vi * 2:
-                            bundle["store"] = [
-                                ("vstore", store_idx_addrs[vi], all_idx[vi]),
-                                ("vstore", store_val_addrs[vi], all_val[vi])
-                            ]
-                            store_vi_idx += 1
-                    self.add_bundle(bundle)
+                    self.add_bundle({"valu": valu_ops[i:i+6]})
             prev_phase_idx += 1
 
-        # Handle remaining store address computation
-        while store_addr_idx < len(store_addr_alu):
-            self.add_bundle({"alu": store_addr_alu[store_addr_idx:store_addr_idx+12]})
-            store_addr_idx += 12
+        # Store results
+        store_idx_addrs = [self.scratch["inp_indices_p"]] + [self.alloc_scratch() for _ in range(n_vectors - 1)]
+        store_val_addrs = [self.scratch["inp_values_p"]] + [self.alloc_scratch() for _ in range(n_vectors - 1)]
 
-        # Store remaining ready vectors and final vectors
-        stored = set(ready_vi[:store_vi_idx])
+        store_addr_alu = []
+        for vi in range(1, n_vectors):
+            base = self.const_map[vi * VLEN]
+            store_addr_alu.append(("+", store_idx_addrs[vi], self.scratch["inp_indices_p"], base))
+            store_addr_alu.append(("+", store_val_addrs[vi], self.scratch["inp_values_p"], base))
+
+        for i in range(0, len(store_addr_alu), 12):
+            self.add_bundle({"alu": store_addr_alu[i:i+12]})
+
         for vi in range(n_vectors):
-            if vi not in stored:
-                self.add_bundle({"store": [
-                    ("vstore", store_idx_addrs[vi], all_idx[vi]),
-                    ("vstore", store_val_addrs[vi], all_val[vi])
-                ]})
+            self.add_bundle({"store": [
+                ("vstore", store_idx_addrs[vi], all_idx[vi]),
+                ("vstore", store_val_addrs[vi], all_val[vi])
+            ]})
 
         self.instrs.append({"flow": [("pause",)]})
+
 
 BASELINE = 147734
 
@@ -520,7 +570,6 @@ def do_kernel_test(
 
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
-    # print(kb.instrs)
 
     value_trace = {}
     machine = Machine(
@@ -546,8 +595,6 @@ def do_kernel_test(
         if prints:
             print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
             print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-        # Updating these in memory isn't required, but you can enable this check for debugging
-        # assert machine.mem[inp_indices_p:inp_indices_p+len(inp.indices)] == ref_mem[inp_indices_p:inp_indices_p+len(inp.indices)]
 
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
@@ -556,9 +603,6 @@ def do_kernel_test(
 
 class Tests(unittest.TestCase):
     def test_ref_kernels(self):
-        """
-        Test the reference kernels against each other
-        """
         random.seed(123)
         for i in range(10):
             f = Tree.generate(4)
@@ -571,34 +615,11 @@ class Tests(unittest.TestCase):
             assert inp.values == mem[mem[6] : mem[6] + len(inp.values)]
 
     def test_kernel_trace(self):
-        # Full-scale example for performance testing
         do_kernel_test(10, 16, 256, trace=True, prints=False)
-
-    # Passing this test is not required for submission, see submission_tests.py for the actual correctness test
-    # You can uncomment this if you think it might help you debug
-    # def test_kernel_correctness(self):
-    #     for batch in range(1, 3):
-    #         for forest_height in range(3):
-    #             do_kernel_test(
-    #                 forest_height + 2, forest_height + 4, batch * 16 * VLEN * N_CORES
-    #             )
 
     def test_kernel_cycles(self):
         do_kernel_test(10, 16, 256)
 
-
-# To run all the tests:
-#    python perf_takehome.py
-# To run a specific test:
-#    python perf_takehome.py Tests.test_kernel_cycles
-# To view a hot-reloading trace of all the instructions:  **Recommended debug loop**
-# NOTE: The trace hot-reloading only works in Chrome. In the worst case if things aren't working, drag trace.json onto https://ui.perfetto.dev/
-#    python perf_takehome.py Tests.test_kernel_trace
-# Then run `python watch_trace.py` in another tab, it'll open a browser tab, then click "Open Perfetto"
-# You can then keep that open and re-run the test to see a new trace.
-
-# To run the proper checks to see which thresholds you pass:
-#    python tests/submission_tests.py
 
 if __name__ == "__main__":
     unittest.main()
