@@ -373,6 +373,8 @@ class KernelBuilder:
 
         # ===== ROUND 1: Indices are 1 or 2 =====
         # node = round1_A + idx * round1_B (using multiply_add)
+        # Collect all round 1 bundles first, then overlap first group addresses with later waves
+        round1_bundles = []
         for wave_start in range(0, n_vectors, GROUP_SIZE):
             wave_end = min(wave_start + GROUP_SIZE, n_vectors)
 
@@ -383,7 +385,7 @@ class KernelBuilder:
                 # multiply_add: spec_node[slot] = all_idx[vi] * round1_B + round1_A
                 node_ops.append(("multiply_add", spec_node[slot], all_idx[vi], round1_B, round1_A))
             for i in range(0, len(node_ops), 6):
-                self.add_bundle({"valu": node_ops[i:i+6]})
+                round1_bundles.append(node_ops[i:i+6])
 
             # Phase 2+: Hash and index update
             all_ops = []
@@ -400,11 +402,10 @@ class KernelBuilder:
                     if phase < len(ops):
                         phase_ops.append(ops[phase])
                 for i in range(0, len(phase_ops), 6):
-                    self.add_bundle({"valu": phase_ops[i:i+6]})
+                    round1_bundles.append(phase_ops[i:i+6])
 
         # ===== ROUNDS 2-15: Pipelined scatter-gather =====
         # Now indices can be anywhere, use standard approach
-        # But we need to compute addresses for the FIRST group of round 2
 
         start_round = 2
         remaining_rounds = rounds - start_round
@@ -468,13 +469,39 @@ class KernelBuilder:
         for step in range(5):
             valu_phases.append(f"idx_{step}")
 
-        # Compute addresses for first group of round 2+
+        # Compute addresses for first group of round 2+ (vectors 0-5)
+        # Overlap with round 1 waves 1+ since wave 0 updates vectors 0-5
         first_group_iters = get_group_iters(0, 0)
         first_addr_ops = []
         for slot, v_idx, v_val in first_group_iters:
             for j in range(VLEN):
                 first_addr_ops.append(("+", s_addr[0][slot][j], forest_p, v_idx + j))
-        for i in range(0, len(first_addr_ops), 12):
+
+        # Count bundles in wave 0 (first GROUP_SIZE vectors of round 1)
+        # Wave 0 has: 1 bundle for node_ops + (len(emit_hash_index_ops result) / GROUP_SIZE) bundles
+        # emit_hash_index_ops produces ~15 ops per vector -> ~15 bundles for wave
+        # Total wave 0 bundles = 1 + ~15 = ~16
+        # Be conservative: find where wave 0 ends in round1_bundles
+        wave0_end = 0
+        ops_per_wave = 1 + len(emit_hash_index_ops(all_val[0], all_idx[0], spec_node[0], spec_tmp1[0], spec_tmp2[0]))
+        wave0_end = ops_per_wave  # bundles for wave 0
+
+        # Emit round 1: first wave0_end bundles as VALU only, then overlap with first_addr_ops
+        for bi, bundle in enumerate(round1_bundles):
+            if bi < wave0_end:
+                # Wave 0: emit VALU only (indices 0-5 being updated)
+                self.add_bundle({"valu": bundle})
+            else:
+                # Waves 1+: can overlap with first group address computation
+                combined = {"valu": bundle}
+                addr_start = (bi - wave0_end) * 12
+                if addr_start < len(first_addr_ops):
+                    combined["alu"] = first_addr_ops[addr_start:addr_start+12]
+                self.add_bundle(combined)
+
+        # Emit any remaining address ops not yet overlapped
+        emitted_addr = (len(round1_bundles) - wave0_end) * 12
+        for i in range(emitted_addr, len(first_addr_ops), 12):
             self.add_bundle({"alu": first_addr_ops[i:i+12]})
 
         prev_buf = None
