@@ -497,11 +497,21 @@ class KernelBuilder:
                 for j in range(VLEN):
                     all_addr_ops.append((g, ("+", s_addr[buf][slot][j], forest_p, v_idx + j)))
 
-        # Emit round 1 with address computation AND group 0 loads overlapped
+        # Emit round 1 with address computation AND multiple group loads overlapped
         addr_idx = 0
-        group0_addrs_done = False
-        group0_loads = emit_loads_for_group(0, get_group_iters(0, 0)) if precomputed_groups > 0 else []
-        load_idx = 0
+
+        # Track which groups have addresses done and their load progress
+        group_loads = []
+        for g in range(precomputed_groups):
+            buf = g % BUFFERS
+            loads = emit_loads_for_group(buf, get_group_iters(g, buf))
+            group_loads.append({
+                'group': g,
+                'buf': buf,
+                'loads': loads,
+                'load_idx': 0,
+                'addrs_done': False
+            })
 
         for bi, bundle in enumerate(round1_bundles):
             wave_num = bi // bundles_per_wave
@@ -509,7 +519,6 @@ class KernelBuilder:
             combined = {"valu": bundle}
 
             # After wave K ends, we can compute addresses for group K
-            # We're in wave wave_num, so waves 0..wave_num-1 are complete
             if wave_num > 0:
                 # Emit addresses for groups whose waves have completed
                 ops_to_emit = []
@@ -523,26 +532,31 @@ class KernelBuilder:
                 if ops_to_emit:
                     combined["alu"] = ops_to_emit
 
-                # Check if group 0 addresses are done
-                if not group0_addrs_done and precomputed_groups > 0:
-                    # Group 0 addresses are done when we've emitted all addr_ops for g=0
-                    # That happens after wave 1 starts (wave_num >= 1) and we've processed all g=0 ops
-                    group0_addr_count = sum(1 for g, op in all_addr_ops if g == 0)
-                    emitted_group0 = sum(1 for i in range(addr_idx) if all_addr_ops[i][0] == 0)
-                    if emitted_group0 >= group0_addr_count or addr_idx >= len(all_addr_ops) or all_addr_ops[addr_idx][0] > 0:
-                        group0_addrs_done = True
+                # Update which groups have addresses done
+                for gl in group_loads:
+                    if not gl['addrs_done']:
+                        g = gl['group']
+                        # Group g addresses are done when all its ops are emitted
+                        if addr_idx >= len(all_addr_ops) or all_addr_ops[addr_idx][0] > g:
+                            gl['addrs_done'] = True
 
-                # If group 0 addresses are done, we can start loading
-                if group0_addrs_done and load_idx < len(group0_loads):
-                    combined["load"] = group0_loads[load_idx:load_idx+2]
-                    load_idx += 2
+                # Load from the first group that has addresses done but isn't fully loaded
+                for gl in group_loads:
+                    if gl['addrs_done'] and gl['load_idx'] < len(gl['loads']):
+                        combined["load"] = gl['loads'][gl['load_idx']:gl['load_idx']+2]
+                        gl['load_idx'] += 2
+                        break
 
             self.add_bundle(combined)
 
         # After all round 1 bundles, emit remaining address ops and loads
-        while addr_idx < len(all_addr_ops) or load_idx < len(group0_loads):
+        any_remaining = True
+        while any_remaining:
+            any_remaining = False
             combined = {}
+
             if addr_idx < len(all_addr_ops):
+                any_remaining = True
                 ops_to_emit = []
                 while addr_idx < len(all_addr_ops) and len(ops_to_emit) < 12:
                     g, op = all_addr_ops[addr_idx]
@@ -550,19 +564,76 @@ class KernelBuilder:
                     addr_idx += 1
                 if ops_to_emit:
                     combined["alu"] = ops_to_emit
-            if load_idx < len(group0_loads):
-                combined["load"] = group0_loads[load_idx:load_idx+2]
-                load_idx += 2
+
+                # Update addrs_done
+                for gl in group_loads:
+                    if not gl['addrs_done']:
+                        g = gl['group']
+                        if addr_idx >= len(all_addr_ops) or all_addr_ops[addr_idx][0] > g:
+                            gl['addrs_done'] = True
+
+            # Load from first ready group
+            for gl in group_loads:
+                if gl['addrs_done'] and gl['load_idx'] < len(gl['loads']):
+                    any_remaining = True
+                    combined["load"] = gl['loads'][gl['load_idx']:gl['load_idx']+2]
+                    gl['load_idx'] += 2
+                    break
+
             if combined:
                 self.add_bundle(combined)
 
-        # If group 0 was pre-loaded, set up state to start VALU for it
-        if precomputed_groups > 0 and load_idx > 0:
-            # Group 0 is already loaded
+        # Count how many groups were fully pre-loaded
+        preloaded_count = sum(1 for gl in group_loads if gl['load_idx'] >= len(gl['loads']))
+
+        # Handle pre-loaded groups: do VALU for groups 0..(preloaded_count-2), then set up for last pre-loaded group
+        if preloaded_count > 1:
+            # Collect VALU bundles for pre-loaded groups (all but the last)
+            preloaded_valu_bundles = []
+            for pg in range(preloaded_count - 1):
+                pg_buf = pg % BUFFERS
+                pg_iters = get_group_iters(pg, pg_buf)
+                for phase_idx in range(len(valu_phases)):
+                    valu_ops = emit_valu_for_group(pg_buf, pg_iters, valu_phases[phase_idx])
+                    if valu_ops:
+                        for i in range(0, len(valu_ops), 6):
+                            preloaded_valu_bundles.append(valu_ops[i:i+6])
+
+            # Set up for the last pre-loaded group
+            last_pg = preloaded_count - 1
+            prev_buf = last_pg % BUFFERS
+            prev_iters = get_group_iters(last_pg, prev_buf)
+            prev_phase_idx = 0
+            start_group = preloaded_count
+
+            # Collect address ops for start_group to overlap with VALU
+            sg_addr_ops = []
+            if start_group < n_groups:
+                sg_buf = start_group % BUFFERS
+                sg_iters = get_group_iters(start_group, sg_buf)
+                for slot, v_idx, v_val in sg_iters:
+                    for j in range(VLEN):
+                        sg_addr_ops.append(("+", s_addr[sg_buf][slot][j], forest_p, v_idx + j))
+
+            # Emit VALU bundles overlapped with start_group address computation
+            sg_addr_idx = 0
+            for valu_bundle in preloaded_valu_bundles:
+                bundle = {"valu": valu_bundle}
+                if sg_addr_idx < len(sg_addr_ops):
+                    bundle["alu"] = sg_addr_ops[sg_addr_idx:sg_addr_idx+12]
+                    sg_addr_idx += 12
+                self.add_bundle(bundle)
+
+            # Emit remaining address ops if any
+            while sg_addr_idx < len(sg_addr_ops):
+                self.add_bundle({"alu": sg_addr_ops[sg_addr_idx:sg_addr_idx+12]})
+                sg_addr_idx += 12
+        elif preloaded_count == 1:
+            # Only group 0 was pre-loaded
             prev_buf = 0
             prev_iters = get_group_iters(0, 0)
             prev_phase_idx = 0
-            start_group = 1  # Skip loading group 0
+            start_group = 1
         else:
             prev_buf = None
             prev_iters = None
