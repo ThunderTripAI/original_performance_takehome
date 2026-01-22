@@ -206,9 +206,10 @@ class KernelBuilder:
         v_tmp1 = [[self.alloc_scratch(None, VLEN) for _ in range(GROUP_SIZE)] for _ in range(BUFFERS)]
         v_tmp2 = [[self.alloc_scratch(None, VLEN) for _ in range(GROUP_SIZE)] for _ in range(BUFFERS)]
 
-        # Temp vectors for specialized rounds
-        spec_tmp1 = [self.alloc_scratch(None, VLEN) for _ in range(GROUP_SIZE)]
-        spec_tmp2 = [self.alloc_scratch(None, VLEN) for _ in range(GROUP_SIZE)]
+        # Temp vectors for specialized rounds - REUSE v_tmp1[0], v_tmp2[0] to save scratch
+        # spec_tmp1/spec_tmp2 are only used during rounds 0-1, v_tmp1/v_tmp2 during rounds 2+
+        spec_tmp1 = v_tmp1[0]  # Reuse buffer 0's tmp1
+        spec_tmp2 = v_tmp2[0]  # Reuse buffer 0's tmp2
         spec_node = [self.alloc_scratch(None, VLEN) for _ in range(GROUP_SIZE)]
 
         idx_addrs = [self.scratch["inp_indices_p"]] + [self.alloc_scratch() for _ in range(n_vectors - 1)]
