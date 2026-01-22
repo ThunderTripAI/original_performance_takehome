@@ -655,21 +655,62 @@ class KernelBuilder:
                     final_valu_bundles.append(valu_ops[i:i+6])
             prev_phase_idx += 1
 
-        # Emit final VALU overlapped with store ALU
+        # Emit final VALU overlapped with store ALU and early stores
+        # The final VALU only touches vectors in the last partial group
+        # Other vectors are already complete and can be stored during final VALU
+
+        # Find which vectors are in the final group (being computed by final VALU)
+        final_group_idx = n_groups - 1
+        final_group_iters = get_group_iters(final_group_idx, final_group_idx % BUFFERS)
+        final_group_vis = set()
+        for slot, v_idx, v_val in final_group_iters:
+            for vi in range(n_vectors):
+                if all_idx[vi] == v_idx:
+                    final_group_vis.add(vi)
+                    break
+
+        # Vectors not in final group can be stored early
+        early_store_vis = [vi for vi in range(n_vectors) if vi not in final_group_vis]
+        late_store_vis = [vi for vi in range(n_vectors) if vi in final_group_vis]
+
         valu_idx = 0
         alu_idx = 0
-        while valu_idx < len(final_valu_bundles) or alu_idx < len(store_addr_alu):
+        store_idx = 0
+
+        # Phase 1: Overlap VALU with store address ALU (no stores yet, addresses not computed)
+        while alu_idx < len(store_addr_alu):
             bundle = {}
             if valu_idx < len(final_valu_bundles):
                 bundle["valu"] = final_valu_bundles[valu_idx]
                 valu_idx += 1
-            if alu_idx < len(store_addr_alu):
-                bundle["alu"] = store_addr_alu[alu_idx:alu_idx+12]
-                alu_idx += 12
-            if bundle:
-                self.add_bundle(bundle)
+            bundle["alu"] = store_addr_alu[alu_idx:alu_idx+12]
+            alu_idx += 12
+            self.add_bundle(bundle)
 
-        for vi in range(n_vectors):
+        # Phase 2: Overlap remaining VALU with early stores (addresses now computed)
+        while valu_idx < len(final_valu_bundles):
+            bundle = {"valu": final_valu_bundles[valu_idx]}
+            valu_idx += 1
+            if store_idx < len(early_store_vis):
+                vi = early_store_vis[store_idx]
+                bundle["store"] = [
+                    ("vstore", store_idx_addrs[vi], all_idx[vi]),
+                    ("vstore", store_val_addrs[vi], all_val[vi])
+                ]
+                store_idx += 1
+            self.add_bundle(bundle)
+
+        # Phase 3: Store remaining early vectors (no more VALU)
+        while store_idx < len(early_store_vis):
+            vi = early_store_vis[store_idx]
+            self.add_bundle({"store": [
+                ("vstore", store_idx_addrs[vi], all_idx[vi]),
+                ("vstore", store_val_addrs[vi], all_val[vi])
+            ]})
+            store_idx += 1
+
+        # Phase 4: Store late vectors (final group VALU complete)
+        for vi in late_store_vis:
             self.add_bundle({"store": [
                 ("vstore", store_idx_addrs[vi], all_idx[vi]),
                 ("vstore", store_val_addrs[vi], all_val[vi])
